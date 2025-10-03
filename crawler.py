@@ -403,7 +403,6 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
     if mode not in ("live", "wayback"):
         raise ValueError("mode must be 'live' or 'wayback'")
 
-    # choose limiters for this run
     page_rate = _page_limiter
     img_rate  = _img_limiter
 
@@ -417,13 +416,16 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
         concurrency = min(concurrency, 2)
 
     seen, in_queue, dropped = set(), set(), []
+    set_lock = threading.Lock()
+
     q = queue.Queue()
     seed_url = parsed_root.geturl()
 
     if ONLY_ENGLISH and not _english_allowed(seed_url, root_netloc):
         raise ValueError("Seed URL is not English (path/subdomain suggests non-EN locale).")
 
-    q.put(seed_url); in_queue.add(seed_url)
+    q.put(seed_url)
+    in_queue.add(seed_url)
 
     tmpdir  = tempfile.mkdtemp(prefix="site_scrape_")
     outroot = os.path.join(tmpdir, "site")
@@ -464,7 +466,8 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
 
         mirror = AssetMirror(
             outroot=outroot,
-            root_host=("web.archive.org" if mode=="wayback" else root_netloc),
+            # keep original root for nicer local paths; Wayback fetches are allowed via allow_offsite
+            root_host=root_netloc,
             session=session,
             rate=asset_rate,
             assets_writer=assets_writer
@@ -519,7 +522,6 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
 
                     if status != 200 or "text/html" not in ctype:
                         logging.debug(f"[skip] {status} {ctype} {fetch_url}")
-                        # (Optional: write a minimal pages row here)
                         break
 
                     html = r.text
@@ -533,7 +535,8 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
                         break
 
                     # Success path
-                    seen.add(url)
+                    with set_lock:
+                        seen.add(url)
                     dest = _dest_for(url, outroot)
 
                     soup = BeautifulSoup(html, "html.parser")
@@ -585,9 +588,15 @@ def crawl_to_zip(start_url: str, max_pages: int = 2000, concurrency: int = 8, ti
                         if not _english_allowed(link_url, root_netloc): continue
 
                         link_writer.writerow([url, link_url, _clean_text(a.get_text())])
-                        if _same_domain(link_url, root_netloc, allow_subdomains=True) and \
-                           link_url not in seen and link_url not in in_queue and len(seen) < max_pages:
-                            q.put(link_url); in_queue.add(link_url)
+
+                        with set_lock:
+                            cond = (_same_domain(link_url, root_netloc, allow_subdomains=True)
+                                    and link_url not in seen
+                                    and link_url not in in_queue
+                                    and len(seen) < max_pages)
+                            if cond:
+                                q.put(link_url)
+                                in_queue.add(link_url)
 
                     # ---- images.csv rows (with status & broken flag)
                     page_base = (f"{WAYBACK_BASE}{ts}/{url}") if mode == "wayback" else url
