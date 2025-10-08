@@ -20,19 +20,26 @@ def index(request: Request):
 @app.post("/crawl")
 def crawl(
     start_url: str = Form(...),
-    max_pages: int = Form(200),   # kept for form compatibility; not used
+    max_pages: int = Form(200),
     mode: str = Form("live"),
-    wayback_ts: str = Form("")
+    wayback_ts: str = Form(""),
+    keyword: str = Form(""),
+    language: str = Form("default"),
+    crawl_type: list[str] = Form(["html"]) 
 ):
     try:
-        logging.info(f"[crawl] start url={start_url}")
-        # temporary output directory for Excel files
+        logging.info(f"[crawl] start={start_url} keyword={keyword} lang={language} types={crawl_type}")
         tmpdir = tempfile.mkdtemp(prefix="site_scraper_")
 
-        # crawl only the start URL for now (you can later expand it to follow links)
-        crawl_pages([start_url], out_dir=tmpdir)
+        crawl_pages(
+            [start_url],
+            out_dir=tmpdir,
+            max_pages=max_pages,
+            keyword_filter=keyword,
+            language_filter=language,
+            crawl_types=crawl_type
+        )
 
-        # create a ZIP archive of all Excel files for download
         from zipfile import ZipFile
         zip_path = os.path.join(tmpdir, "site_excels.zip")
         with ZipFile(zip_path, "w") as z:
@@ -42,12 +49,7 @@ def crawl(
                         fp = os.path.join(root, fn)
                         z.write(fp, arcname=fn)
 
-        logging.info(f"[crawl] completed; zip at {zip_path}")
-        return FileResponse(
-            zip_path,
-            media_type="application/zip",
-            filename="site_excels.zip"
-        )
+        return FileResponse(zip_path, media_type="application/zip", filename="site_excels.zip")
 
     except Exception as e:
         logging.exception("[crawl] failed")

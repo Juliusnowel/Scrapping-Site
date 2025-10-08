@@ -9,27 +9,56 @@
 <body>
 <main class="container">
   <h1>Site Scraper</h1>
-  <p class="sub">Paste a URL. Choose source. Receive a ZIP with HTML, links.csv, images.csv, manifest.csv.</p>
+  <p class="sub">Paste a URL, select options, and get structured Excel reports per page and in a combined ZIP.</p>
 
   <form id="crawlForm" action="/crawl" method="post" target="dlframe" onsubmit="lockForm()">
-    <label for="start_url">Website URL</label>
-    <input id="start_url" name="start_url" type="url" placeholder="https://example.com/" required>
+    <div class="form-split">
+      <!-- LEFT PANEL -->
+      <div class="form-panel">
+        <label for="start_url">Website URL</label>
+        <input id="start_url" name="start_url" type="url" placeholder="https://example.com/" required>
 
-    <fieldset>
-      <legend>Source</legend>
-      <label><input type="radio" name="mode" value="live" checked> Live site</label>
-      <label><input type="radio" name="mode" value="wayback"> Wayback snapshot</label>
-    </fieldset>
+        <fieldset>
+          <legend>Source</legend>
+          <label><input type="radio" name="mode" value="live" checked> Live site</label>
+          <label><input type="radio" name="mode" value="wayback"> Wayback snapshot</label>
+        </fieldset>
 
-    <label for="wayback_ts">Wayback timestamp (optional)</label>
-    <input id="wayback_ts" name="wayback_ts" type="text" placeholder="YYYYMMDDhhmmss (leave blank = latest)">
-    
-    <label for="max_pages">Max pages (safety cap)</label>
-    <input id="max_pages" name="max_pages" type="number" value="200" min="1" step="1">
+        <label for="wayback_ts">Wayback timestamp (optional)</label>
+        <input id="wayback_ts" name="wayback_ts" type="text" placeholder="YYYYMMDDhhmmss (leave blank = latest)">
 
-    <button id="go" type="submit">Crawl & Download ZIP</button>
-    <p id="status" class="muted"></p>
+        <label for="max_pages">Max pages (safety cap)</label>
+        <input id="max_pages" name="max_pages" type="number" value="200" min="1" step="1">
+
+        <label for="keyword">Keyword Filter (optional)</label>
+        <input id="keyword" name="keyword" type="text" placeholder="Example: Philippines, Filipino, adobo">
+      </div>
+
+      <!-- RIGHT PANEL -->
+      <div class="form-panel">
+        <label for="language">Language to Crawl</label>
+        <select id="language" name="language">
+          <option value="default" selected>Default / English (no /ko, /ja)</option>
+          <option value="ko">Korean (/ko)</option>
+          <option value="ja">Japanese (/ja)</option>
+          <option value="all">All languages</option>
+        </select>
+        <fieldset>
+          <legend>Select Data Type(s) to Include</legend>
+          <p class="muted small">You can check one or multiple crawl data sets.</p>
+
+          <label><input type="checkbox" name="crawl_type" value="url_info"> URL & Crawl Info</label><br>
+          <label><input type="checkbox" name="crawl_type" value="performance"> Performance</label><br>
+          <label><input type="checkbox" name="crawl_type" value="images"> Images</label><br>
+          <label><input type="checkbox" name="crawl_type" value="html" checked> HTML Only (Headings, Paragraphs, Images)</label>
+        </fieldset>
+
+        <button id="go" type="submit">Crawl & Download ZIP</button>
+        <p id="status" class="muted"></p>
+      </div>
+    </div>
   </form>
+
 
   <iframe name="dlframe" id="dlframe" style="display:none;"></iframe>
 </main>
@@ -45,7 +74,6 @@
     statusEl.textContent = hasErr ? "Error — see message above." : "Complete. Check your Downloads.";
     document.getElementById('go').disabled = false;
   });
-  // show error from redirect, if any
   const urlParams = new URLSearchParams(window.location.search);
   if (urlParams.has("error")) {
     statusEl.textContent = "Error: " + urlParams.get("error");
