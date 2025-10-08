@@ -3,3 +3,4 @@ uvicorn[standard]
 requests
 beautifulsoup4
 jinja2python-multipart
+openpyxl

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Site Scraper</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="container">
+  <h1>Site Scraper</h1>
+  <p class="sub">Paste a URL. Choose source. Receive a ZIP with HTML, links.csv, images.csv, manifest.csv.</p>
+
+  <form id="crawlForm" action="/crawl" method="post" target="dlframe" onsubmit="lockForm()">
+    <label for="start_url">Website URL</label>
+    <input id="start_url" name="start_url" type="url" placeholder="https://example.com/" required>
+
+    <fieldset>
+      <legend>Source</legend>
+      <label><input type="radio" name="mode" value="live" checked> Live site</label>
+      <label><input type="radio" name="mode" value="wayback"> Wayback snapshot</label>
+    </fieldset>
+
+    <label for="wayback_ts">Wayback timestamp (optional)</label>
+    <input id="wayback_ts" name="wayback_ts" type="text" placeholder="YYYYMMDDhhmmss (leave blank = latest)">
+    
+    <label for="max_pages">Max pages (safety cap)</label>
+    <input id="max_pages" name="max_pages" type="number" value="200" min="1" step="1">
+
+    <button id="go" type="submit">Crawl & Download ZIP</button>
+    <p id="status" class="muted"></p>
+  </form>
+
+  <iframe name="dlframe" id="dlframe" style="display:none;"></iframe>
+</main>
+
+<script>
+  const statusEl = document.getElementById('status');
+  function lockForm(){
+    document.getElementById('go').disabled = true;
+    statusEl.textContent = "Working… download will start automatically.";
+  }
+  document.getElementById('dlframe').addEventListener('load', () => {
+    const hasErr = new URLSearchParams(window.location.search).has("error");
+    statusEl.textContent = hasErr ? "Error — see message above." : "Complete. Check your Downloads.";
+    document.getElementById('go').disabled = false;
+  });
+  // show error from redirect, if any
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.has("error")) {
+    statusEl.textContent = "Error: " + urlParams.get("error");
+    statusEl.style.color = "red";
+  }
+</script>
+</body>
+</html>

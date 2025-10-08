@@ -1,10 +1,10 @@
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from urllib.parse import urlparse
-from crawler import crawl_to_zip, CONCURRENCY
-import io, logging
+from crawler_excel import crawl_pages
+import os, tempfile, logging
 
 logging.basicConfig(level=logging.INFO)
 
@@ -16,33 +16,39 @@ templates = Jinja2Templates(directory="templates")
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+
 @app.post("/crawl")
 def crawl(
     start_url: str = Form(...),
-    max_pages: int = Form(200),
-    mode: str = Form("live"),              # "live" | "wayback"
-    wayback_ts: str = Form("")             # optional YYYYMMDDhhmmss
+    max_pages: int = Form(200),   # kept for form compatibility; not used
+    mode: str = Form("live"),
+    wayback_ts: str = Form("")
 ):
     try:
-        logging.info(f"[crawl] start url={start_url} mode={mode} ts={wayback_ts or 'latest'} max_pages={max_pages} conc={CONCURRENCY}")
-        zip_bytes = crawl_to_zip(
-            start_url=start_url,
-            max_pages=max_pages,
-            concurrency=CONCURRENCY,
-            mode=mode,
-            wayback_timestamp=(wayback_ts.strip() or None),
-        )
-        domain = urlparse(start_url).netloc.replace(":", "_") or "site"
-        suffix = f"-wb{wayback_ts}" if mode == "wayback" and wayback_ts else ("-wblast" if mode=="wayback" else "")
-        filename = f"site-snapshot-{domain}{suffix}.zip"
-        return StreamingResponse(
-            io.BytesIO(zip_bytes),
+        logging.info(f"[crawl] start url={start_url}")
+        # temporary output directory for Excel files
+        tmpdir = tempfile.mkdtemp(prefix="site_scraper_")
+
+        # crawl only the start URL for now (you can later expand it to follow links)
+        crawl_pages([start_url], out_dir=tmpdir)
+
+        # create a ZIP archive of all Excel files for download
+        from zipfile import ZipFile
+        zip_path = os.path.join(tmpdir, "site_excels.zip")
+        with ZipFile(zip_path, "w") as z:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    if fn.endswith(".xlsx"):
+                        fp = os.path.join(root, fn)
+                        z.write(fp, arcname=fn)
+
+        logging.info(f"[crawl] completed; zip at {zip_path}")
+        return FileResponse(
+            zip_path,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"',
-                     "Content-Length": str(len(zip_bytes))}
+            filename="site_excels.zip"
         )
+
     except Exception as e:
         logging.exception("[crawl] failed")
         return RedirectResponse(url=f"/?error={str(e)}", status_code=303)
-
-# Run: python -m uvicorn app:app --reload --port 8000
