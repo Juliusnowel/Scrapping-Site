@@ -21,11 +21,11 @@ def index(request: Request):
 def crawl(
     start_url: str = Form(...),
     max_pages: int = Form(200),
-    mode: str = Form("live"),
-    wayback_ts: str = Form(""),
     keyword: str = Form(""),
     language: str = Form("default"),
-    crawl_type: list[str] = Form(["html"]) 
+    page_scope: str = Form("both"),
+    crawl_type: str = Form(["html"]),
+    save_individual: bool = Form(False),
 ):
     try:
         logging.info(f"[crawl] start={start_url} keyword={keyword} lang={language} types={crawl_type}")
@@ -37,7 +37,10 @@ def crawl(
             max_pages=max_pages,
             keyword_filter=keyword,
             language_filter=language,
-            crawl_types=crawl_type
+            crawl_types=[crawl_type],
+            page_scope=page_scope,
+            zip_results=False,
+            save_individual=save_individual,  
         )
 
         from zipfile import ZipFile
@@ -47,7 +50,7 @@ def crawl(
                 for fn in files:
                     if fn.endswith(".xlsx"):
                         fp = os.path.join(root, fn)
-                        z.write(fp, arcname=fn)
+                        z.write(fp, arcname=os.path.relpath(fp, start=tmpdir))
 
         return FileResponse(zip_path, media_type="application/zip", filename="site_excels.zip")
 

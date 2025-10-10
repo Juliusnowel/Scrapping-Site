@@ -32,10 +32,6 @@
 
         <label for="keyword">Keyword Filter (optional)</label>
         <input id="keyword" name="keyword" type="text" placeholder="Example: Philippines, Filipino, adobo">
-      </div>
-
-      <!-- RIGHT PANEL -->
-      <div class="form-panel">
         <label for="language">Language to Crawl</label>
         <select id="language" name="language">
           <option value="default" selected>Default / English (no /ko, /ja)</option>
@@ -43,15 +39,33 @@
           <option value="ja">Japanese (/ja)</option>
           <option value="all">All languages</option>
         </select>
-        <fieldset>
-          <legend>Select Data Type(s) to Include</legend>
-          <p class="muted small">You can check one or multiple crawl data sets.</p>
+      </div>
 
-          <label><input type="checkbox" name="crawl_type" value="url_info"> URL & Crawl Info</label><br>
-          <label><input type="checkbox" name="crawl_type" value="performance"> Performance</label><br>
-          <label><input type="checkbox" name="crawl_type" value="images"> Images</label><br>
-          <label><input type="checkbox" name="crawl_type" value="html" checked> HTML Only (Headings, Paragraphs, Images)</label>
+      <!-- RIGHT PANEL -->
+      <div class="form-panel">
+        <label for="page_scope">Page Type to Crawl</label>
+        <select id="page_scope" name="page_scope">
+          <option value="both" selected>All (Blog + Landing Pages)</option>
+          <option value="landing">Landing Pages Only</option>
+          <option value="blog">Blog / Article Pages Only</option>
+        </select>
+        <fieldset>
+          <legend>Output</legend>
+          <label>
+            <input type="checkbox" name="save_individual" value="1">
+            Save individual Excel per page (slower, detailed)
+          </label>
         </fieldset>
+        <fieldset>
+          <legend>Select Data Type to Include</legend>
+          <p class="muted small">Choose one crawl data set at a time.</p>
+
+          <label><input type="radio" name="crawl_type" value="url_info"> URL & Crawl Info</label><br>
+          <label><input type="radio" name="crawl_type" value="performance"> Performance</label><br>
+          <label><input type="radio" name="crawl_type" value="images"> Images</label><br>
+          <label><input type="radio" name="crawl_type" value="html" checked> HTML Only (Headings, Paragraphs, Images)</label>
+        </fieldset>
+
 
         <button id="go" type="submit">Crawl & Download ZIP</button>
         <p id="status" class="muted"></p>
