@@ -1,16 +1,207 @@
-import os, re, time, logging, hashlib, zipfile, pathlib
+# crawler_excel.py
+import os, re, time, random, logging, hashlib, zipfile, pathlib
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from collections import deque, defaultdict
 import textstat
 
 logging.basicConfig(level=logging.INFO)
-HEADERS = {"User-Agent": "SiteScraperBot/1.0 (+https://example.com)"}
 
-# --- blog detection ---
+# ----------------------------- HTTP SESSION -----------------------------
+
+HEADERS = {
+    # Realistic desktop Chrome UA + standard browsery headers
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+SESSION.max_redirects = 5  # defensive
+
+# Per-host last-request timestamps for polite pacing
+_LAST_REQ_TS = defaultdict(lambda: 0.0)
+
+def _sleep_for_rate_limit(url: str, rpm: int, jitter_ratio: float = 0.25):
+    """Simple per-host pacing: ensures ~rpm requests per minute per host, with jitter."""
+    host = urlparse(url).netloc
+    min_interval = 60.0 / max(1, rpm)
+    now = time.monotonic()
+    elapsed = now - _LAST_REQ_TS[host]
+    if elapsed < min_interval:
+        # jitter up to 25% of min_interval (default) to avoid lockstep
+        jitter = random.uniform(0, min_interval * jitter_ratio)
+        time.sleep((min_interval - elapsed) + jitter)
+    _LAST_REQ_TS[host] = time.monotonic()
+
+def _parse_retry_after(header_val: str) -> float | None:
+    """Return seconds to wait from Retry-After header (either seconds or HTTP-date)."""
+    if not header_val:
+        return None
+    header_val = header_val.strip()
+    if header_val.isdigit():
+        return max(0.0, float(header_val))
+    try:
+        dt = parsedate_to_datetime(header_val)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+def _base_host(h: str) -> str:
+    h = (h or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+CANON_HOST = None  # pinned canonical host set in crawl_pages()
+
+def same_domain(url, root):
+    u = _base_host(urlparse(url).hostname or "")
+    r = _base_host(urlparse(root).hostname or "")
+    return u == r or u.endswith("." + r)
+
+def _pin_host(u: str) -> str:
+    """Force links to use the original start_url host (prevents www <-> apex flip 404)."""
+    if not CANON_HOST:
+        return u
+    p = urlparse(u)
+    if _base_host(p.netloc) == _base_host(CANON_HOST) and p.netloc != CANON_HOST:
+        p = p._replace(netloc=CANON_HOST)
+    return urlunparse(p)
+
+# Skip assets / utility URLs so we don't waste requests
+_ASSET_EXT_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|webp|svg|ico|bmp|mp4|webm|mp3|wav|pdf|docx?|xlsx?|pptx?|zip|rar|7z)(?:\?.*)?$",
+    re.I
+)
+def _is_crawlable_http_url(u: str) -> bool:
+    if not u or not u.startswith(("http://", "https://")):
+        return False
+    if _ASSET_EXT_RE.search(urlparse(u).path or ""):
+        return False
+    p = urlparse(u)
+    if p.scheme not in ("http", "https"):
+        return False
+    # Skip common CDN/utility paths that show up as links
+    if "/cdn-cgi/" in p.path:
+        return False
+    return True
+
+def _normalize(u: str) -> str:
+    p = urlparse(u)
+    path = re.sub(r"/{2,}", "/", p.path or "/")
+    # Only add trailing slash if path looks like a directory (no file extension)
+    if path != "/" and not path.endswith("/"):
+        if not re.search(r"/[^/]+\.[A-Za-z0-9]{1,8}$", path):
+            path += "/"
+    p = p._replace(path=path)
+    return _pin_host(urlunparse(p))
+
+def _get_robots_crawl_delay(start_url: str) -> float | None:
+    """Very small robots.txt parser to honor Crawl-delay if present."""
+    try:
+        robots_url = urljoin(start_url, "/robots.txt")
+        _sleep_for_rate_limit(robots_url, rpm=30)  # don't hammer robots either
+        r = SESSION.get(robots_url, timeout=10)
+        if not r.ok or not r.text:
+            return None
+        ua = None
+        delay_for_star = None
+        for raw in r.text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):  # comments
+                continue
+            if line.lower().startswith("user-agent:"):
+                ua = line.split(":", 1)[1].strip().lower()
+                continue
+            if line.lower().startswith("crawl-delay:"):
+                try:
+                    val = float(line.split(":", 1)[1].strip())
+                except Exception:
+                    continue
+                if ua in (None, "", "*"):
+                    delay_for_star = val
+                # We send Chrome UA, but most robots files only specify "*"
+        return delay_for_star
+    except Exception:
+        return None
+
+def fetch(url: str,
+          timeout: int = 15,
+          max_hops: int = 3,
+          max_retries: int = 4,
+          rate_limit_rpm: int = 12,
+          referer: str | None = None):
+    """
+    Polite fetch with:
+      - per-host pacing (rpm)
+      - manual redirect following (within same domain)
+      - exponential backoff + jitter on 429/503
+      - honors Retry-After when present
+    """
+    cur = url
+    hops = 0
+    tries = 0
+    last = None
+
+    while True:
+        _sleep_for_rate_limit(cur, rpm=rate_limit_rpm)
+
+        headers = SESSION.headers.copy()
+        if referer:
+            headers["Referer"] = referer
+
+        r = SESSION.get(cur, timeout=timeout, allow_redirects=False, headers=headers)
+        last = r
+
+        # Follow same-domain redirects (cap hops)
+        if 300 <= r.status_code < 400 and hops < max_hops:
+            loc = r.headers.get("Location", "")
+            if not loc:
+                break
+            nxt = _pin_host(urljoin(cur, loc))
+            if same_domain(nxt, url):
+                cur = nxt
+                hops += 1
+                continue
+            else:
+                break
+
+        # Success or non-retryable status -> return
+        if r.status_code < 400:
+            return r
+
+        # Retryable statuses (rate limit / transient)
+        if r.status_code in (429, 503):
+            tries += 1
+            retry_after = _parse_retry_after(r.headers.get("Retry-After", ""))
+            if retry_after is None:
+                # exp backoff: 1s, 2s, 4s, 8s (+ jitter)
+                wait = min(8.0, (2 ** (tries - 1)))
+                wait += random.uniform(0.2, 0.8)
+            else:
+                wait = max(0.5, retry_after) + random.uniform(0.2, 0.8)
+            logging.warning(f"Rate limited ({r.status_code}) on {cur}. Backing off {wait:.1f}s (try {tries}/{max_retries}).")
+            time.sleep(wait)
+            if tries < max_retries:
+                continue
+            return r  # give up after retries
+        # Other 4xx/5xx: return; caller will decide
+        return r
+
+# ----------------------------- BLOG/TYPE -----------------------------
+
 BLOG_HINTS = [
     "/blog", "/article", "/news", "/posts", "/stories", "/insights",
     "/definition", "/definitions", "/review", "/reviews",
@@ -25,14 +216,6 @@ def is_blog_path(path: str) -> bool:
 
 def clean(text):
     return re.sub(r"\s+", " ", text or "").strip()
-
-def same_domain(url, root):
-    try:
-        u = (urlparse(url).hostname or "").lower()
-        r = (urlparse(root).hostname or "").lower()
-        return u == r or (u.endswith("." + r) if r else False)
-    except Exception:
-        return False
 
 def get_output_directory(url, base_out_dir="output_excels"):
     parsed = urlparse(url)
@@ -50,29 +233,20 @@ def get_output_directory(url, base_out_dir="output_excels"):
     type_folder = "blog" if is_blog_path(path) else "landing-pages"
 
     out_dir = os.path.join(base_out_dir, lang_folder, type_folder)
-    # os.makedirs(os.path.join(out_dir, "individual"), exist_ok=True)
     return out_dir, os.path.join(out_dir, "individual")
 
-# ------------------------- SCRAPE MODES -------------------------
+# ----------------------------- SCRAPERS -----------------------------
 
-def scrape_html_content(soup, url, pattern=None):
-    """Extract HTML elements: headings, paragraphs, images."""
-    def match(text):
-        return not pattern or (text and pattern.search(text.lower()))
+def scrape_html_content(soup, base_url, pattern=None):
+    def match(text): return not pattern or (text and pattern.search(text.lower()))
+    def match_alt(alt): return not pattern or (alt and pattern.search(alt.lower()))
 
-    def match_alt(alt):
-        return not pattern or (alt and pattern.search(alt.lower()))
-
-    # IMAGES: output as list of dicts so master workbook can tabulate them
     images = []
     for i in soup.find_all("img"):
         src = i.get("src")
         if not src:
             continue
-        images.append({
-            "src": urljoin(url, src),
-            "alt": clean(i.get("alt"))
-        })
+        images.append({"src": urljoin(base_url, src), "alt": clean(i.get("alt"))})
     if pattern:
         images = [d for d in images if match_alt(d["alt"])]
 
@@ -88,7 +262,6 @@ def scrape_html_content(soup, url, pattern=None):
     }
 
 def scrape_url_info(resp, soup):
-    """Structured output with exact 'URL & Crawl Info' headers."""
     title = soup.title.get_text(strip=True) if soup.title else ""
     metas = {m.get("name", "").lower(): m.get("content", "") for m in soup.find_all("meta") if m.get("name")}
     canonical = [l.get("href") for l in soup.find_all("link", rel="canonical")]
@@ -135,23 +308,14 @@ def scrape_url_info(resp, soup):
 
     page_size = len(resp.content)
     co2_mg = round(page_size / 1000 * 0.2, 2)
-    carbon_rating = (
-        "A" if co2_mg < 100 else
-        "B" if co2_mg < 200 else
-        "C" if co2_mg < 300 else
-        "D" if co2_mg < 400 else "E"
-    )
+    carbon_rating = ("A" if co2_mg < 100 else "B" if co2_mg < 200 else
+                     "C" if co2_mg < 300 else "D" if co2_mg < 400 else "E")
 
     mobile_alt = soup.find("link", rel="alternate", media=re.compile("mobile", re.I))
     semantic_similarity = len(set([w.lower() for w in title.split()]) & set([w.lower() for w in desc.split()]))
 
-    status_map = {
-        200: "OK",
-        301: "Moved Permanently",
-        302: "Moved Temporarily",
-        404: "Not Found",
-        429: "Too Many Requests"
-    }
+    status_map = {200: "OK", 301: "Moved Permanently", 302: "Moved Temporarily",
+                  404: "Not Found", 429: "Too Many Requests"}
 
     if 300 <= resp.status_code < 400:
         index_status = "Redirected"
@@ -162,10 +326,9 @@ def scrape_url_info(resp, soup):
     else:
         index_status = "OK"
 
-    # accurate depths based on path only
     path_only = urlparse(resp.url).path.strip("/")
     folder_depth = path_only.count("/") + (1 if path_only else 0)
-    crawl_depth = folder_depth  # BFS depth tracking not implemented; using path depth
+    crawl_depth = folder_depth
 
     return {
         "URL": resp.url,
@@ -231,8 +394,8 @@ def scrape_url_info(resp, soup):
         "Hash": hashlib.md5(resp.content).hexdigest(),
         "Response Time": resp.elapsed.total_seconds(),
         "Last Modified": resp.headers.get("Last-Modified", ""),
-        "Redirect URL": resp.history[0].headers.get("Location", "") if resp.history else "",
-        "Redirect Type": resp.history[0].status_code if resp.history else "",
+        "Redirect URL": resp.headers.get("Location", ""),
+        "Redirect Type": resp.status_code if 300 <= resp.status_code < 400 else "",
         "Cookies Language": resp.headers.get("Content-Language", ""),
         "HTTP Version": getattr(resp.raw, "version", ""),
         "Mobile Alternate Link": mobile_alt["href"] if mobile_alt else "",
@@ -240,12 +403,11 @@ def scrape_url_info(resp, soup):
         "Semantic Similarity Score": semantic_similarity,
         "No. Semantically Similar": len(set([semantic_similarity])),
         "Semantic Relevance Score": round(semantic_similarity / max(len(title.split()), 1), 2) if title else "",
-        "URL Encoded Address": requests.utils.quote(resp.url),
+        "URL Encoded Address": requests.utils.quote(resp.url, safe=""),
         "Crawl Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 def scrape_performance(resp, soup):
-    """Structured 'Performance' output with fixed column order."""
     html_size = len(resp.text)
     img_tags = soup.find_all("img")
     js_tags = soup.find_all("script", src=True)
@@ -324,7 +486,6 @@ def scrape_image_analysis(soup, url, timeout=10):
             r = session.head(src, allow_redirects=True, timeout=timeout)
             broken = not r.ok
             redirected = len(r.history) > 0
-
             size = int(r.headers.get("Content-Length", 0))
             if size > 0:
                 img_size_str = f"{size / 1_000_000:.2f} MB" if size >= 1_000_000 else f"{size / 1024:.0f} KB"
@@ -348,44 +509,48 @@ def scrape_image_analysis(soup, url, timeout=10):
     session.close()
     return data
 
-# ------------------------- MASTER SCRAPER -------------------------
+# ----------------------------- MASTER SCRAPER -----------------------------
 
-def scrape_page(url, keywords=None, crawl_types=None):
+def scrape_page(url, referer=None, keywords=None, crawl_types=None, rate_limit_rpm=12):
     logging.info(f"Scraping {url}")
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = fetch(url, rate_limit_rpm=rate_limit_rpm, referer=referer)
+        # If a host flip produced 404, retry once pinned
+        if resp.status_code == 404 and _base_host(urlparse(resp.url).netloc) != _base_host(urlparse(url).netloc):
+            retry = _pin_host(resp.url)
+            resp = fetch(retry, rate_limit_rpm=rate_limit_rpm, referer=referer)
         resp.raise_for_status()
     except Exception as e:
         logging.warning(f"Failed to load {url}: {e}")
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    base = resp.url
 
     pattern = None
     if keywords:
         pattern = re.compile("|".join([re.escape(k.lower()) for k in keywords]), re.IGNORECASE)
 
     results = {}
-
-    if "html" in crawl_types:
-        results["html"] = scrape_html_content(soup, url, pattern)
-    if "url_info" in crawl_types:
+    if "html" in (crawl_types or []):
+        results["html"] = scrape_html_content(soup, base, pattern)
+    if "url_info" in (crawl_types or []):
         results["url_info"] = scrape_url_info(resp, soup)
-    if "performance" in crawl_types:
+    if "performance" in (crawl_types or []):
         results["performance"] = scrape_performance(resp, soup)
-    if "images" in crawl_types:
-        results["images"] = scrape_image_analysis(soup, url)
+    if "images" in (crawl_types or []):
+        results["images"] = scrape_image_analysis(soup, base)
 
+    # Extract crawlable links (normalized, absolute, same scheme)
     links = []
     for a in soup.find_all("a", href=True):
-        h = urljoin(url, a["href"]).split("#", 1)[0]
-        if h.startswith(("http://", "https://")):
+        h = urljoin(base, a["href"]).split("#", 1)[0]
+        if _is_crawlable_http_url(h):
             links.append(h)
     results["links"] = links
-
     return results
 
-# ------------------------- WRITERS -------------------------
+# ----------------------------- WRITERS -----------------------------
 
 def _apply_header_style(ws):
     from openpyxl.styles import PatternFill, Font
@@ -407,7 +572,6 @@ def write_excel(page_name, data, out_dir):
         if sheet_name == "images" and isinstance(sheet_data, list) and sheet_data and isinstance(sheet_data[0], tuple):
             sheet_data = [{"src": t[0], "alt": t[1]} for t in sheet_data]
 
-        # Horizontal layout for "url_info"
         if sheet_name == "url_info" and isinstance(sheet_data, dict):
             headers = list(sheet_data.keys())
             ws.append(headers)
@@ -433,7 +597,6 @@ def write_excel(page_name, data, out_dir):
             for k, v in sheet_data.items():
                 ws.append([k, str(v)])
 
-        # Column sizing
         if ws.max_column:
             for col in range(1, ws.max_column + 1):
                 ws.column_dimensions[get_column_letter(col)].width = 35
@@ -446,10 +609,6 @@ def write_excel(page_name, data, out_dir):
     logging.info(f"Saved {path}")
 
 def write_master_excel(all_data, out_dir):
-    """
-    Create combined workbook per (language/type) folder with unique name:
-    all_<lang>_<type>.xlsx (e.g., all_default_blog.xlsx)
-    """
     if not all_data:
         logging.info(f"Skipping master workbook for {out_dir} (no pages).")
         return
@@ -461,7 +620,6 @@ def write_master_excel(all_data, out_dir):
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     header_font = Font(bold=True)
 
-    # Determine available sections from first page
     sample_page = all_data[0][1] if all_data else {}
     available_sections = [k for k in sample_page.keys() if k not in ["links"]]
 
@@ -490,14 +648,12 @@ def write_master_excel(all_data, out_dir):
     for section in available_sections:
         ws = wb.create_sheet(title=section[:31])
 
-        # Build headers
         if section == "url_info":
             headers = ["Page"] + fixed_url_headers
         else:
             headers = ["Page"]
             for _, page_data in all_data:
                 section_data = page_data.get(section)
-                # Backward-compat images-as-tuples
                 if section == "images" and isinstance(section_data, list) and section_data and isinstance(section_data[0], tuple):
                     section_data = [{"src": t[0], "alt": t[1]} for t in section_data]
                 if isinstance(section_data, dict):
@@ -506,7 +662,6 @@ def write_master_excel(all_data, out_dir):
                     if isinstance(section_data[0], dict):
                         headers.extend(h for h in section_data[0].keys() if h not in headers)
                     else:
-                        # scalar list -> single "Value" column
                         if "Value" not in headers:
                             headers.append("Value")
 
@@ -516,7 +671,6 @@ def write_master_excel(all_data, out_dir):
             c.fill = header_fill
             c.font = header_font
 
-        # Rows
         for page_name, page_data in all_data:
             section_data = page_data.get(section)
             if section == "images" and isinstance(section_data, list) and section_data and isinstance(section_data[0], tuple):
@@ -529,33 +683,26 @@ def write_master_excel(all_data, out_dir):
                     for entry in section_data:
                         ws.append([page_name] + [str(entry.get(h, "")) for h in headers[1:]])
                 else:
-                    # scalar list
                     for val in section_data:
                         row = [page_name] + [""] * (len(headers) - 2) + [str(val)]
                         ws.append(row)
 
-        # Column sizing
         for col in range(1, len(headers) + 1):
             ws.column_dimensions[get_column_letter(col)].width = 30
 
     if "Sheet" in wb.sheetnames:
         wb.remove(wb["Sheet"])
 
-    # ---- UNIQUE MASTER FILENAME (prevents collisions) ----
-    lang_name   = os.path.basename(os.path.dirname(out_dir))   # 'default', 'ko', 'ja'
-    type_name   = os.path.basename(out_dir)                    # 'blog' or 'landing-pages'
+    lang_name = os.path.basename(os.path.dirname(out_dir))
+    type_name = os.path.basename(out_dir)
     path = os.path.join(out_dir, f"all_{lang_name}_{type_name}.xlsx")
 
     wb.save(path)
     logging.info(f"✅ Combined workbook saved → {path}")
 
-# ------------------------- PACKAGING (keeps folders!) -------------------------
+# ----------------------------- PACKAGING -----------------------------
 
 def zip_output(root_dir, zip_path=None):
-    """
-    Zip the entire output while PRESERVING folder structure.
-    Avoids duplicate-arcname overwrites.
-    """
     root_dir = os.path.abspath(root_dir)
     if zip_path is None:
         zip_path = root_dir + ".zip"
@@ -568,7 +715,7 @@ def zip_output(root_dir, zip_path=None):
     logging.info(f"📦 Zipped → {zip_path}")
     return zip_path
 
-# ------------------------- MAIN CRAWLER -------------------------
+# ----------------------------- LANGUAGE FILTER -----------------------------
 
 def is_allowed_language(url, root_url, language_filter):
     try:
@@ -591,10 +738,7 @@ def is_allowed_language(url, root_url, language_filter):
     except Exception:
         return True
 
-def _normalize(u: str) -> str:
-    p = urlparse(u)
-    path = re.sub(r"/+$", "/", p.path) or "/"
-    return f"{p.scheme}://{p.netloc}{path}" + (f"?{p.query}" if p.query else "")
+# ----------------------------- MAIN CRAWLER -----------------------------
 
 def crawl_pages(start_urls,
                 out_dir="output_excels",
@@ -604,12 +748,32 @@ def crawl_pages(start_urls,
                 crawl_types=None,
                 page_scope="both",
                 zip_results=False,
-                save_individual=True):
+                save_individual=True,
+                rate_limit_rpm=12,
+                obey_robots_delay=True):
+    """
+    rate_limit_rpm: approx requests per minute per host (polite pacing).
+    obey_robots_delay: if robots.txt has Crawl-delay, use the slower of that and rate_limit_rpm.
+    """
     if crawl_types is None:
         crawl_types = ["html"]
 
+    # Pin canonical host for redirect stability
+    global CANON_HOST
+    CANON_HOST = urlparse(start_urls[0]).netloc
+
+    # Robots crawl-delay → convert to rpm (slower wins)
+    if obey_robots_delay:
+        cd = _get_robots_crawl_delay(start_urls[0])
+        if cd and cd > 0:
+            robots_rpm = max(1, int(60.0 / cd))
+            if robots_rpm < rate_limit_rpm:
+                logging.info(f"robots.txt crawl-delay detected ({cd}s). Using ~{robots_rpm} rpm.")
+                rate_limit_rpm = robots_rpm
+
     keywords = [k.strip() for k in keyword_filter.split(",") if k.strip()]
     seen, queue = set(), deque(_normalize(u) for u in start_urls)
+    referers = { _normalize(start_urls[0]): None }  # track referer per URL we enqueue
     queued = set(queue)
     root = _normalize(start_urls[0])
     all_data = []
@@ -625,7 +789,6 @@ def crawl_pages(start_urls,
 
         path_lower = urlparse(url).path.lower()
         is_blog = is_blog_path(path_lower)
-
         if page_scope == "landing" and is_blog:
             logging.info(f"Skipping blog/article page: {url}")
             continue
@@ -633,15 +796,22 @@ def crawl_pages(start_urls,
             logging.info(f"Skipping non-blog page: {url}")
             continue
 
-        page_data = scrape_page(url, keywords, crawl_types)
+        page_data = scrape_page(url,
+                                referer=referers.get(url),
+                                keywords=keywords,
+                                crawl_types=crawl_types,
+                                rate_limit_rpm=rate_limit_rpm)
         if not page_data:
+            # if we got throttled too much, take a longer cooldown and continue
+            time.sleep(3.0)
             continue
 
         seen.add(url)
 
         page_name = urlparse(url).path.strip("/") or "index"
-        page_name = page_name.replace("/", "_")[:80]  # keeps full path components, reduces collisions
+        page_name = page_name.replace("/", "_")[:80]
         structured_out_dir, individual_dir = get_output_directory(url, out_dir)
+
         logging.info("=" * 60)
         logging.info(f"📂 [LANG+TYPE] → {individual_dir}")
         logging.info(f"🌐 Crawling URL: {url}")
@@ -655,13 +825,23 @@ def crawl_pages(start_urls,
 
         all_data.append((page_name, page_data, structured_out_dir))
 
+        # Enqueue children
         for link in page_data.get("links", []):
             link = _normalize(link)
-            if link not in seen and link not in queued and same_domain(link, root) and is_allowed_language(link, root, language_filter):
-                queue.append(link)
-                queued.add(link)
+            if link in seen or link in queued:
+                continue
+            if not same_domain(link, root):
+                continue
+            if not is_allowed_language(link, root, language_filter):
+                continue
+            if not _is_crawlable_http_url(link):
+                continue
+            queue.append(link)
+            referers[link] = url  # set referer to current page
+            queued.add(link)
 
-        time.sleep(0.5)
+        # base think-time between pages (extra politeness layer)
+        time.sleep(random.uniform(0.4, 1.0))
 
     grouped = defaultdict(list)
     for page_name, page_data, structured_out_dir in all_data:
@@ -680,4 +860,3 @@ def crawl_pages(start_urls,
     if zip_results:
         return zip_output(out_dir)
     return out_dir
-
