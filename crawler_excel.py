@@ -137,67 +137,46 @@ def _get_robots_crawl_delay(start_url: str) -> float | None:
     except Exception:
         return None
 
-def fetch(url: str,
-          timeout: int = 15,
-          max_hops: int = 3,
-          max_retries: int = 4,
-          rate_limit_rpm: int = 12,
-          referer: str | None = None):
-    """
-    Polite fetch with:
-      - per-host pacing (rpm)
-      - manual redirect following (within same domain)
-      - exponential backoff + jitter on 429/503
-      - honors Retry-After when present
-    """
+def fetch(url: str, timeout: int = 15, max_hops: int = 10, max_retries: int = 4,
+          rate_limit_rpm: int = 12, referer: str | None = None):
     cur = url
     hops = 0
     tries = 0
-    last = None
+    chain = []  # collect (status, from, to)
 
     while True:
         _sleep_for_rate_limit(cur, rpm=rate_limit_rpm)
-
         headers = SESSION.headers.copy()
         if referer:
             headers["Referer"] = referer
 
         r = SESSION.get(cur, timeout=timeout, allow_redirects=False, headers=headers)
-        last = r
 
-        # Follow same-domain redirects (cap hops)
         if 300 <= r.status_code < 400 and hops < max_hops:
-            loc = r.headers.get("Location", "")
+            loc = r.headers.get("Location")
             if not loc:
-                break
-            nxt = _pin_host(urljoin(cur, loc))
-            if same_domain(nxt, url):
-                cur = nxt
-                hops += 1
-                continue
-            else:
-                break
+                # attach chain before returning
+                r._redirect_chain = chain
+                r._redirected = bool(chain)
+                return r
+            nxt = urljoin(cur, loc)
+            chain.append((r.status_code, cur, nxt))
+            referer = cur
+            cur = nxt
+            hops += 1
+            continue
 
-        # Success or non-retryable status -> return
-        if r.status_code < 400:
-            return r
-
-        # Retryable statuses (rate limit / transient)
         if r.status_code in (429, 503):
             tries += 1
             retry_after = _parse_retry_after(r.headers.get("Retry-After", ""))
-            if retry_after is None:
-                # exp backoff: 1s, 2s, 4s, 8s (+ jitter)
-                wait = min(8.0, (2 ** (tries - 1)))
-                wait += random.uniform(0.2, 0.8)
-            else:
-                wait = max(0.5, retry_after) + random.uniform(0.2, 0.8)
-            logging.warning(f"Rate limited ({r.status_code}) on {cur}. Backing off {wait:.1f}s (try {tries}/{max_retries}).")
+            wait = (max(0.5, retry_after) if retry_after is not None else min(8.0, (2 ** (tries - 1)))) + random.uniform(0.2, 0.8)
             time.sleep(wait)
             if tries < max_retries:
                 continue
-            return r  # give up after retries
-        # Other 4xx/5xx: return; caller will decide
+
+        # attach chain before returning
+        r._redirect_chain = chain
+        r._redirected = bool(chain)
         return r
 
 # ----------------------------- BLOG/TYPE -----------------------------
@@ -329,13 +308,20 @@ def scrape_url_info(resp, soup):
     path_only = urlparse(resp.url).path.strip("/")
     folder_depth = path_only.count("/") + (1 if path_only else 0)
     crawl_depth = folder_depth
+    redirect_chain = getattr(resp, "_redirect_chain", [])
+
+    # --- FIX: authoritative indexability ---
+    indexability = "Indexable" if "noindex" not in robots else "Non-Indexable"
+    if 300 <= resp.status_code < 400 or redirect_chain:
+        indexability = "Non-Indexable"
+    # ---------------------------------------
 
     return {
         "URL": resp.url,
         "Content Type": resp.headers.get("Content-Type", ""),
         "Status Code": resp.status_code,
         "Status": status_map.get(resp.status_code, "Other"),
-        "Indexability": "Indexable" if "noindex" not in robots else "Non-Indexable",
+        "Indexability": indexability,
         "Indexability Status": index_status,
         "Title 1": title,
         "Title 1 Length": len(title),
@@ -404,7 +390,10 @@ def scrape_url_info(resp, soup):
         "No. Semantically Similar": len(set([semantic_similarity])),
         "Semantic Relevance Score": round(semantic_similarity / max(len(title.split()), 1), 2) if title else "",
         "URL Encoded Address": requests.utils.quote(resp.url, safe=""),
-        "Crawl Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "Crawl Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),  
+        "Final URL": resp.url,
+        "Redirected?": 1 if redirect_chain else 0,
+        "Redirect Chain": " -> ".join([f"{status}:{src} => {dst}" for status, src, dst in redirect_chain]),
     }
 
 def scrape_performance(resp, soup):
@@ -642,7 +631,7 @@ def write_master_excel(all_data, out_dir):
         "Spelling Errors","Grammar Errors","Hash","Response Time","Last Modified",
         "Redirect URL","Redirect Type","Cookies Language","HTTP Version","Mobile Alternate Link",
         "Closest Semantically Similar Address","Semantic Similarity Score","No. Semantically Similar",
-        "Semantic Relevance Score","URL Encoded Address","Crawl Timestamp"
+        "Semantic Relevance Score","URL Encoded Address","Crawl Timestamp","Final URL","Redirected?","Redirect Chain"
     ]
 
     for section in available_sections:
