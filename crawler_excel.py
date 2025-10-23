@@ -9,13 +9,13 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from collections import deque, defaultdict
 import textstat
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 
 # ----------------------------- HTTP SESSION -----------------------------
 
 HEADERS = {
-    # Realistic desktop Chrome UA + standard browsery headers
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0.0.0 Safari/537.36"),
@@ -40,7 +40,6 @@ def _sleep_for_rate_limit(url: str, rpm: int, jitter_ratio: float = 0.25):
     now = time.monotonic()
     elapsed = now - _LAST_REQ_TS[host]
     if elapsed < min_interval:
-        # jitter up to 25% of min_interval (default) to avoid lockstep
         jitter = random.uniform(0, min_interval * jitter_ratio)
         time.sleep((min_interval - elapsed) + jitter)
     _LAST_REQ_TS[host] = time.monotonic()
@@ -93,7 +92,6 @@ def _is_crawlable_http_url(u: str) -> bool:
     p = urlparse(u)
     if p.scheme not in ("http", "https"):
         return False
-    # Skip common CDN/utility paths that show up as links
     if "/cdn-cgi/" in p.path:
         return False
     return True
@@ -112,7 +110,7 @@ def _get_robots_crawl_delay(start_url: str) -> float | None:
     """Very small robots.txt parser to honor Crawl-delay if present."""
     try:
         robots_url = urljoin(start_url, "/robots.txt")
-        _sleep_for_rate_limit(robots_url, rpm=30)  # don't hammer robots either
+        _sleep_for_rate_limit(robots_url, rpm=30)
         r = SESSION.get(robots_url, timeout=10)
         if not r.ok or not r.text:
             return None
@@ -120,7 +118,7 @@ def _get_robots_crawl_delay(start_url: str) -> float | None:
         delay_for_star = None
         for raw in r.text.splitlines():
             line = raw.strip()
-            if not line or line.startswith("#"):  # comments
+            if not line or line.startswith("#"):
                 continue
             if line.lower().startswith("user-agent:"):
                 ua = line.split(":", 1)[1].strip().lower()
@@ -132,7 +130,6 @@ def _get_robots_crawl_delay(start_url: str) -> float | None:
                     continue
                 if ua in (None, "", "*"):
                     delay_for_star = val
-                # We send Chrome UA, but most robots files only specify "*"
         return delay_for_star
     except Exception:
         return None
@@ -155,7 +152,6 @@ def fetch(url: str, timeout: int = 15, max_hops: int = 10, max_retries: int = 4,
         if 300 <= r.status_code < 400 and hops < max_hops:
             loc = r.headers.get("Location")
             if not loc:
-                # attach chain before returning
                 r._redirect_chain = chain
                 r._redirected = bool(chain)
                 return r
@@ -174,7 +170,6 @@ def fetch(url: str, timeout: int = 15, max_hops: int = 10, max_retries: int = 4,
             if tries < max_retries:
                 continue
 
-        # attach chain before returning
         r._redirect_chain = chain
         r._redirected = bool(chain)
         return r
@@ -185,9 +180,13 @@ BLOG_HINTS = [
     "/blog", "/article", "/news", "/posts", "/stories", "/insights",
     "/definition", "/definitions", "/review", "/reviews",
     "/how-to", "/how-tos", "/howto", "/guide", "/guides", "/tutorial",
-    "/category"
+    "/category",
+    # ✅ your real categories
+    "/travel-experiences", "/travel-guides", "/travel-insights", "/travel-stories",
+    "/여행-가이드", "/여행-경험", "/여행-이야기", "/여행-인사이트",
+    "/uncategorized-ko"
 ]
-DATE_RE = re.compile(r"/\d{4}/\d{2}/")  # WP yyyy/mm
+DATE_RE = re.compile(r"/\d{4}/\d{2}/|/ko/|/eu/|/sea/")
 
 def is_blog_path(path: str) -> bool:
     p = path.lower()
@@ -213,6 +212,56 @@ def get_output_directory(url, base_out_dir="output_excels"):
 
     out_dir = os.path.join(base_out_dir, lang_folder, type_folder)
     return out_dir, os.path.join(out_dir, "individual")
+
+# ----------------------------- SITEMAP DISCOVERY -----------------------------
+
+SITEMAP_HINTS = ("/sitemap_index.xml", "/sitemap.xml", "/news-sitemap.xml")
+
+def _get_text(e, name):
+    t = e.find(name)
+    return (t.text or "").strip() if t is not None else ""
+
+def discover_urls_from_sitemaps(root_url: str) -> list[str]:
+    """Fetch sitemap index and child sitemaps, return a list of URLs (best effort)."""
+    found = []
+    base = urlparse(root_url)
+    base_root = f"{base.scheme}://{base.netloc}"
+    to_try = [urljoin(base_root, h) for h in SITEMAP_HINTS]
+
+    for sm in list(to_try):
+        try:
+            _sleep_for_rate_limit(sm, rpm=12)
+            r = SESSION.get(sm, timeout=12, allow_redirects=True)
+            if not r.ok or not r.text.lstrip().startswith("<?xml"):
+                continue
+            root = ET.fromstring(r.text)
+            tag = root.tag.lower()
+            ns = ""
+            if tag.startswith("{"):
+                ns = tag.split("}", 1)[0] + "}"
+            # sitemap index
+            if root.tag.endswith("sitemapindex"):
+                for s in root.findall(f".//{ns}sitemap"):
+                    loc = _get_text(s, f"{ns}loc")
+                    if loc:
+                        to_try.append(loc)
+            # urlset
+            elif root.tag.endswith("urlset"):
+                for u in root.findall(f".//{ns}url"):
+                    loc = _get_text(u, f"{ns}loc")
+                    if loc and _is_crawlable_http_url(loc):
+                        found.append(loc)
+        except Exception:
+            continue
+
+    # de-dupe and pin host
+    seen = set()
+    out = []
+    for u in found:
+        nu = _normalize(u)
+        if nu not in seen and same_domain(nu, root_url):
+            out.append(nu); seen.add(nu)
+    return out
 
 # ----------------------------- SCRAPERS -----------------------------
 
@@ -310,11 +359,10 @@ def scrape_url_info(resp, soup):
     crawl_depth = folder_depth
     redirect_chain = getattr(resp, "_redirect_chain", [])
 
-    # --- FIX: authoritative indexability ---
+    # authoritative indexability
     indexability = "Indexable" if "noindex" not in robots else "Non-Indexable"
     if 300 <= resp.status_code < 400 or redirect_chain:
         indexability = "Non-Indexable"
-    # ---------------------------------------
 
     return {
         "URL": resp.url,
@@ -390,7 +438,7 @@ def scrape_url_info(resp, soup):
         "No. Semantically Similar": len(set([semantic_similarity])),
         "Semantic Relevance Score": round(semantic_similarity / max(len(title.split()), 1), 2) if title else "",
         "URL Encoded Address": requests.utils.quote(resp.url, safe=""),
-        "Crawl Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),  
+        "Crawl Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "Final URL": resp.url,
         "Redirected?": 1 if redirect_chain else 0,
         "Redirect Chain": " -> ".join([f"{status}:{src} => {dst}" for status, src, dst in redirect_chain]),
@@ -536,6 +584,16 @@ def scrape_page(url, referer=None, keywords=None, crawl_types=None, rate_limit_r
         h = urljoin(base, a["href"]).split("#", 1)[0]
         if _is_crawlable_http_url(h):
             links.append(h)
+
+    # Pagination discovery (WP archives)
+    next_link = soup.find("link", rel="next")
+    if next_link and next_link.get("href"):
+        links.append(urljoin(base, next_link["href"]))
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"/page/\d+/?$", href):
+            links.append(urljoin(base, href))
+
     results["links"] = links
     return results
 
@@ -762,10 +820,24 @@ def crawl_pages(start_urls,
 
     keywords = [k.strip() for k in keyword_filter.split(",") if k.strip()]
     seen, queue = set(), deque(_normalize(u) for u in start_urls)
-    referers = { _normalize(start_urls[0]): None }  # track referer per URL we enqueue
+    referers = {_normalize(start_urls[0]): None}  # track referer per URL we enqueue
     queued = set(queue)
     root = _normalize(start_urls[0])
     all_data = []
+
+    # ---------- Seed with sitemap URLs ----------
+    try:
+        sitemap_urls = discover_urls_from_sitemaps(start_urls[0])
+        for u in sitemap_urls:
+            if len(queued) >= max_pages:
+                break
+            if is_allowed_language(u, start_urls[0], language_filter) and u not in queued:
+                queue.append(u)
+                queued.add(u)
+                referers[u] = None
+        logging.info(f"Sitemap seeding: queued {len(sitemap_urls)} URLs (pre-filter).")
+    except Exception as e:
+        logging.warning(f"Sitemap seeding failed: {e}")
 
     while queue and len(seen) < max_pages:
         raw = queue.popleft()
@@ -782,8 +854,10 @@ def crawl_pages(start_urls,
             logging.info(f"Skipping blog/article page: {url}")
             continue
         if page_scope == "blog" and not is_blog:
-            logging.info(f"Skipping non-blog page: {url}")
-            continue
+            # Always crawl the starting page to discover blog links
+            if url != root and not re.search(r"/(eu|sea)(/|$)", urlparse(url).path):
+                logging.info(f"Skipping non-blog page: {url}")
+                continue
 
         page_data = scrape_page(url,
                                 referer=referers.get(url),
@@ -791,7 +865,6 @@ def crawl_pages(start_urls,
                                 crawl_types=crawl_types,
                                 rate_limit_rpm=rate_limit_rpm)
         if not page_data:
-            # if we got throttled too much, take a longer cooldown and continue
             time.sleep(3.0)
             continue
 
@@ -826,10 +899,9 @@ def crawl_pages(start_urls,
             if not _is_crawlable_http_url(link):
                 continue
             queue.append(link)
-            referers[link] = url  # set referer to current page
+            referers[link] = url
             queued.add(link)
 
-        # base think-time between pages (extra politeness layer)
         time.sleep(random.uniform(0.4, 1.0))
 
     grouped = defaultdict(list)
