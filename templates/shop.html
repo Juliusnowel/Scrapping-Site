@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Marketplace Scraper</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="container">
+  <!-- <nav class="top-nav">
+    <a href="/">Site Audit</a>
+    <a href="/shop" class="active">Shop Scraper</a>
+  </nav> -->
+
+  <h1>Marketplace Scraper</h1>
+  <p class="sub">
+    Paste a Shopee or Lazada <strong>shop URL</strong> and download a ZIP containing:
+    products.xlsx + all product images.
+  </p>
+
+  <p id="shop_status" class="muted"></p>
+
+    <form id="shopForm" action="/scrape_shop" method="post" target="dlframe" onsubmit="lockForm()">
+        <div class="form-panel">
+            <label for="shop_url">Shop URL (Shopee / Lazada)</label>
+            <input id="shop_url" name="shop_url" type="url"
+                placeholder="https://shopee.ph/noyona_official?..." required>
+
+            <label for="product_urls">Product URLs (optional)</label>
+            <textarea id="product_urls" name="product_urls" rows="6"
+                    placeholder="One product URL per line&#10;https://shopee.ph/...-i.556889314.29852738081"></textarea>
+
+            <p class="muted small">
+            The scraper auto-detects platform and fetches titles, prices, descriptions, tags,
+            variants (if available), and all product images.
+            </p>
+
+            <fieldset>
+            <legend>Output</legend>
+            <label>
+                <input type="checkbox" name="include_excel" value="1" checked>
+                Export products.xlsx
+            </label>
+            <label>
+                <input type="checkbox" name="include_images" value="1" checked>
+                Download images ZIP
+            </label>
+            <p class="muted small">Uncheck to limit output (e.g., Excel only or images only).</p>
+            </fieldset>
+
+            <button id="go" type="submit">Scrape Shop & Download ZIP</button>
+            <p id="status" class="muted"></p>
+        </div>
+        </form>
+
+
+
+  <iframe name="dlframe" id="dlframe" style="display:none;"></iframe>
+</main>
+
+<script>
+  const statusEl = document.getElementById('status');
+  const shopStatus = document.getElementById('shop_status');
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("error")) {
+    shopStatus.textContent = "Error: " + params.get("error");
+    shopStatus.style.color = "red";
+  }
+
+  function lockForm() {
+    document.getElementById('go').disabled = true;
+    statusEl.textContent = "Working… download will start automatically.";
+  }
+
+  document.getElementById('dlframe').addEventListener('load', () => {
+    // We don't get query params here, so just assume completion.
+    statusEl.textContent = "Complete. Check your Downloads.";
+    document.getElementById('go').disabled = false;
+  });
+
+</script>
+</body>
+</html>

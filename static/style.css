@@ -243,3 +243,27 @@ button:hover { animation: pulse 1.8s infinite; }
     padding: 1.5rem;
   }
 }
+
+
+/* Simple top navigation between tools */
+.top-nav {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.top-nav a {
+  color: #a8b3c5;
+  text-decoration: none;
+  font-weight: 500;
+  font-size: 0.95rem;
+}
+
+.top-nav a:hover {
+  color: #00d8ff;
+}
+
+.top-nav a.active {
+  color: #00e6ff;
+}
